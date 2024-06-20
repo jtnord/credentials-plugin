@@ -30,6 +30,7 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import hudson.Extension;
+import hudson.PluginManager;
 import hudson.Util;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
@@ -45,6 +46,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Paths;
+import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
@@ -59,6 +61,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import jenkins.model.Jenkins;
+import jenkins.security.FIPS140;
 import net.jcip.annotations.GuardedBy;
 import org.apache.commons.fileupload.FileItem;
 import org.apache.commons.lang.StringUtils;
@@ -149,17 +152,18 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
         if (keyStore == null || keyStoreLastModified < lastModified) {
             KeyStore keyStore;
             try {
-                keyStore = KeyStore.getInstance("PKCS12");
-            } catch (KeyStoreException e) {
-                throw new IllegalStateException("PKCS12 is a keystore type per the JLS spec", e);
-            }
-            try {
-                keyStore.load(new ByteArrayInputStream(keyStoreSource.getKeyStoreBytes()), toCharArray(password));
-            } catch (CertificateException | NoSuchAlgorithmException | IOException e) {
+                keyStore = keyStoreSource.toKeyStore(toCharArray(password));
+            } catch (GeneralSecurityException | IOException e) {
                 LogRecord lr = new LogRecord(Level.WARNING, "Credentials ID {0}: Could not load keystore from {1}");
                 lr.setParameters(new Object[]{getId(), keyStoreSource});
                 lr.setThrown(e);
                 LOGGER.log(lr);
+                // provide an empty KeyStore for consumers
+                try {
+                    keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+                } catch (KeyStoreException e2) {
+                    throw new IllegalStateException("JVM can not create a KeyStore of the JVM Default Type ("+ KeyStore.getDefaultType() +")", e2);
+                }
             }
             this.keyStore = keyStore;
             this.keyStoreLastModified = lastModified;
@@ -229,9 +233,15 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
          * Returns the {@code byte[]} content of the {@link KeyStore}.
          *
          * @return the {@code byte[]} content of the {@link KeyStore}.
+         * @deprecated code should not implement this, but rather create a keystore on demand by implementing createKeyStore.
+         *             Implementaions may store the they may 
          */
         @NonNull
-        public abstract byte[] getKeyStoreBytes();
+        @Deprecated(forRemoval = true)
+        public byte[] getKeyStoreBytes() {
+            throw new IllegalStateException("Callers should use toKeyStore");
+        }
+        
 
         /**
          * Returns a {@link System#currentTimeMillis()} comparable timestamp of when the content was last modified.
@@ -241,6 +251,29 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
          * @return a {@link System#currentTimeMillis()} comparable timestamp of when the content was last modified.
          */
         public abstract long getKeyStoreLastModified();
+
+        /**
+         * Returns an in memory {@link KeyStore} created from the source.
+         *
+         * @return The KeyStore content of the {@link KeyStore}.
+         * @throws GeneralSecurityException if there was an issue creating the KeyStore
+         * @throws IOException if there was an IOException whilst creating the KeyStore
+         */
+        @NonNull
+        public KeyStore toKeyStore(char[] password) throws NoSuchAlgorithmException, CertificateException, KeyStoreException, KeyStoreException, IOException {
+            if (FIPS140.useCompliantAlgorithms()) {
+                Class<? extends KeyStoreSource> self = this.getClass();
+                String className = self.getName();
+                String pluginName = Jenkins.get().getPluginManager().whichPlugin(self).getShortName();
+                throw new IllegalStateException(className + " is not FIPS compliant and can not be used when Jenkins is in FIPS mode. " +
+                                                "An issue should be filed against the plugin " + pluginName + " to ensure it is adapted to be able to work in this mode");
+            }
+            // legacy behaviour that assumed all KeyStoreSources where in the non compliant PKCS12 format
+            KeyStore keyStore = KeyStore.getInstance("PKCS12");
+            keyStore.load(new ByteArrayInputStream(getKeyStoreBytes()), password);
+            return keyStore;
+        }
+
 
         /**
          * Returns {@code true} if and only if the source is self contained.
@@ -404,7 +437,7 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
     }
 
     /**
-     * Let the user reference an uploaded file.
+     * Let the user reference an uploaded PKCS12 file.
      */
     public static class UploadedKeyStoreSource extends KeyStoreSource implements Serializable {
         /**
@@ -435,6 +468,7 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
         @SuppressWarnings("unused") // by stapler
         @Deprecated
         public UploadedKeyStoreSource(String uploadedKeystore) {
+            ensureNotRunningInFIPSMode();
             this.uploadedKeystoreBytes = StringUtils.isBlank(uploadedKeystore)
                     ? null
                     : SecretBytes.fromBytes(DescriptorImpl.toByteArray(Secret.fromString(uploadedKeystore)));
@@ -449,6 +483,7 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
         @SuppressWarnings("unused") // by stapler
         @Deprecated
         public UploadedKeyStoreSource(@CheckForNull SecretBytes uploadedKeystore) {
+            ensureNotRunningInFIPSMode();
             this.uploadedKeystoreBytes = uploadedKeystore;
         }
 
@@ -461,6 +496,7 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
         @SuppressWarnings("unused") // by stapler
         @DataBoundConstructor
         public UploadedKeyStoreSource(FileItem uploadedCertFile, @CheckForNull SecretBytes uploadedKeystore) {
+            ensureNotRunningInFIPSMode();
             if (uploadedCertFile != null) {
                 byte[] fileBytes = uploadedCertFile.get();
                 if (fileBytes.length != 0) {
@@ -478,6 +514,7 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
          * @since 2.1.5
          */
         private Object readResolve() throws ObjectStreamException {
+            ensureNotRunningInFIPSMode();
             if (uploadedKeystore != null && uploadedKeystoreBytes == null) {
                 return new UploadedKeyStoreSource(SecretBytes.fromBytes(DescriptorImpl.toByteArray(uploadedKeystore)));
             }
@@ -526,12 +563,30 @@ public class CertificateCredentialsImpl extends BaseStandardCredentials implemen
             return "UploadedKeyStoreSource{uploadedKeystoreBytes=******}";
         }
 
+        /*
+         * Prevents the use of any direct usage of the class when running in FIPS mode as PKCS12 is not compliant.
+         */
+        private static void ensureNotRunningInFIPSMode() {
+            if (FIPS140.useCompliantAlgorithms()) {
+                throw new IllegalStateException("UploadedKeyStoreSource is not FIPS compliant and can not be used when Jenkins is in FIPS mode. " +
+                                                "This is an error in the calling code and an issue should be filed against the plugin that is calling to adapt to become FIPS compliant.");
+            }
+        }
+
         /**
          * {@inheritDoc}
          */
-        @Extension
         public static class DescriptorImpl extends KeyStoreSourceDescriptor {
             public static final String DEFAULT_VALUE = UploadedKeyStoreSource.class.getName() + ".default-value";
+
+            /**
+             * Creates the extension if we are not in FIPS mode, do <em>NOT</em> call this directly!
+             */
+            @Restricted(NoExternalUse.class)
+            @Extension
+            public static DescriptorImpl extension() {
+                return FIPS140.useCompliantAlgorithms() ? new DescriptorImpl() : null;
+            }
 
             /**
              * Decode the {@link Base64} keystore wrapped in a {@link Secret}.
